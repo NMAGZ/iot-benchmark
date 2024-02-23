@@ -19,11 +19,14 @@
 
 package cn.edu.tsinghua.iot.benchmark.cnosdb;
 
+import cn.edu.tsinghua.iot.benchmark.cnosdb.api.CnosdbConnection;
+import cn.edu.tsinghua.iot.benchmark.cnosdb.api.CnosdbResponse;
 import cn.edu.tsinghua.iot.benchmark.conf.Config;
 import cn.edu.tsinghua.iot.benchmark.conf.ConfigDescriptor;
 import cn.edu.tsinghua.iot.benchmark.entity.Batch.IBatch;
 import cn.edu.tsinghua.iot.benchmark.entity.Record;
 import cn.edu.tsinghua.iot.benchmark.entity.Sensor;
+import cn.edu.tsinghua.iot.benchmark.entity.enums.SensorType;
 import cn.edu.tsinghua.iot.benchmark.influxdb.InfluxDB;
 import cn.edu.tsinghua.iot.benchmark.influxdb.InfluxDataModel;
 import cn.edu.tsinghua.iot.benchmark.measurement.Status;
@@ -38,37 +41,43 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.OkHttpClient.Builder;
 import okhttp3.Response;
+import org.apache.commons.lang3.StringUtils;
 import org.influxdb.dto.BatchPoints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 public class CnosDB extends InfluxDB implements IDatabase {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(CnosDB.class);
-  private static Config config = ConfigDescriptor.getInstance().getConfig();
+  private static final Config config = ConfigDescriptor.getInstance().getConfig();
 
-  private final String cnosUrl;
-  private final String cnosDbName;
+  private final String cnosdbUrl;
+  private final String cnosdbUsername;
+  private final String cnosdbPassword;
+  private final String cnosdbDatabase;
 
   private org.influxdb.InfluxDB influxDbInstance;
-  private CnosConnection cnosConnection;
-  private static final long TIMESTAMP_TO_NANO = getToNanoConst(config.getTIMESTAMP_PRECISION());
+  private CnosdbConnection connection;
+  private static final long TIMESTAMP_TO_NANO =
+      InfluxDB.getToNanoConst(config.getTIMESTAMP_PRECISION());
+
+  private ThreadLocal<StringBuilder> buffer;
 
   /** constructor. */
   public CnosDB(DBConfig dbConfig) {
     super(dbConfig);
-    cnosUrl = "http://" + dbConfig.getHOST().get(0) + ":" + dbConfig.getPORT().get(0);
-    cnosDbName = dbConfig.getDB_NAME();
+    this.cnosdbUrl = "http://" + dbConfig.getHOST().get(0) + ":" + dbConfig.getPORT().get(0);
+    this.cnosdbUsername = dbConfig.getUSERNAME();
+    this.cnosdbPassword = dbConfig.getPASSWORD();
+    this.cnosdbDatabase = dbConfig.getDB_NAME();
+    this.buffer = new ThreadLocal<>();
   }
 
   @Override
@@ -80,8 +89,8 @@ public class CnosDB extends InfluxDB implements IDatabase {
               .readTimeout(5, TimeUnit.MINUTES)
               .writeTimeout(5, TimeUnit.MINUTES)
               .retryOnConnectionFailure(true);
-      influxDbInstance = org.influxdb.InfluxDBFactory.connect(cnosUrl, client);
-      cnosConnection = new CnosConnection(cnosUrl, cnosDbName);
+      influxDbInstance = org.influxdb.InfluxDBFactory.connect(cnosdbUrl, client);
+      connection = new CnosdbConnection(cnosdbUrl, cnosdbUsername, cnosdbPassword, cnosdbDatabase);
     } catch (Exception e) {
       LOGGER.error("Initialize CnosDB failed because ", e);
       throw new TsdbException(e);
@@ -91,7 +100,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
   @Override
   public void cleanup() throws TsdbException {
     try {
-      Response response = cnosConnection.execute("DROP DATABASE IF EXISTS " + cnosDbName);
+      Response response = connection.execute("DROP DATABASE IF EXISTS " + cnosdbDatabase);
       response.close();
     } catch (Exception e) {
       LOGGER.error("Cleanup CnosDB failed because ", e);
@@ -106,10 +115,10 @@ public class CnosDB extends InfluxDB implements IDatabase {
     try {
       start = System.nanoTime();
       Response response =
-          cnosConnection.execute(
+          connection.execute(
               String.format(
                   "create database if not exists %s with shard %d",
-                  cnosDbName, config.getCNOSDB_SHARD_NUMBER()));
+                  cnosdbDatabase, config.getCNOSDB_SHARD_NUMBER()));
       response.close();
       end = System.nanoTime();
     } catch (Exception e) {
@@ -121,12 +130,12 @@ public class CnosDB extends InfluxDB implements IDatabase {
 
   @Override
   public Status insertOneBatch(IBatch batch) {
-    BatchPoints batchPoints = BatchPoints.database(cnosDbName).build();
+    BatchPoints batchPoints = BatchPoints.database(cnosdbDatabase).build();
     try {
       InfluxDataModel model;
       for (Record record : batch.getRecords()) {
         model =
-            createDataModel(
+            super.createDataModel(
                 batch.getDeviceSchema(), record.getTimestamp(), record.getRecordDataValue());
         batchPoints.point(model.toInfluxPoint());
       }
@@ -143,7 +152,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
   @Override
   public Status groupByQueryOrderByDesc(GroupByQuery groupByQuery) {
     String sql = getAggQuerySqlHead(groupByQuery.getDeviceSchema(), groupByQuery.getAggFun());
-    sql = addWhereTimeClause(sql, groupByQuery);
+    sql = InfluxDB.addWhereTimeClause(sql, groupByQuery);
     sql = addGroupByClause(sql, groupByQuery.getGranularity());
     return addTailClausesAndExecuteQueryAndGetStatus(sql);
   }
@@ -159,7 +168,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
 
     try {
       long cnt = 0;
-      Response response = cnosConnection.execute(sql);
+      Response response = connection.execute(sql);
       BufferedReader bufferedReader =
           new BufferedReader(new InputStreamReader(response.body().byteStream()));
       String line;
@@ -189,31 +198,6 @@ public class CnosDB extends InfluxDB implements IDatabase {
   @Override
   public String addGroupByClause(String sqlHeader, long timeGranularity) {
     return sqlHeader + " GROUP BY date_bin(INTERVAL '" + timeGranularity + "' MILLISECOND, time)";
-  }
-
-  /**
-   * generate simple query header.
-   *
-   * @param devices schema list of query devices
-   * @return Simple Query header. e.g. SELECT s_0, s_3 FROM root.group_0, root.group_1
-   *     WHERE(device='d_0' OR device='d_1')
-   */
-  @Override
-  public String getSimpleQuerySqlHead(List<DeviceSchema> devices) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("SELECT CAST(time AS BIGINT) AS time, ");
-    if (config.isALIGN_BY_DEVICE()) {
-      builder.append("device, ");
-    }
-    List<Sensor> querySensors = devices.get(0).getSensors();
-
-    builder.append(querySensors.get(0).getName());
-    for (int i = 1; i < querySensors.size(); i++) {
-      builder.append(", ").append(querySensors.get(i).getName());
-    }
-
-    builder.append(generateConstrainForDevices(devices));
-    return builder.toString();
   }
 
   /**
@@ -256,87 +240,236 @@ public class CnosDB extends InfluxDB implements IDatabase {
       }
     }
 
-    builder.append(generateConstrainForDevices(devices));
+    builder.append(super.generateConstrainForDevices(devices));
     return builder.toString();
   }
 
-  /**
-   * Using in verification
-   *
-   * @param verificationQuery
-   */
+  /** Using in verification */
   @Override
   public Status verificationQuery(VerificationQuery verificationQuery) {
-    DeviceSchema deviceSchema = verificationQuery.getDeviceSchema();
-    List<DeviceSchema> deviceSchemas = new ArrayList<>();
-    deviceSchemas.add(deviceSchema);
+    Instant startInstant = Instant.now();
 
+    DeviceSchema deviceSchema = verificationQuery.getDeviceSchema();
+    List<Sensor> sensors = deviceSchema.getSensors();
+    if (sensors == null) {
+      sensors = new ArrayList<>(0);
+    }
     List<Record> records = verificationQuery.getRecords();
     if (records == null || records.isEmpty()) {
       return new Status(
           false,
-          new TsdbException("There are no records in verficationQuery."),
-          "There are no records in verficationQuery.");
+          new TsdbException("There are no records in verificationQuery."),
+          "There are no records in verificationQuery.");
     }
 
-    StringBuilder sql = new StringBuilder();
-    sql.append(getSimpleQuerySqlHead(deviceSchemas));
-    Map<Long, List<Object>> recordMap = new HashMap<>();
-    if (!deviceSchemas.isEmpty()) {
-      sql.append("and (time = ").append(records.get(0).getTimestamp() * TIMESTAMP_TO_NANO);
+    StringBuilder buffer = this.buffer.get();
+    if (buffer == null) {
+      buffer = new StringBuilder();
+      this.buffer.set(buffer);
     } else {
-      sql.append("WHERE time = ").append(records.get(0).getTimestamp() * TIMESTAMP_TO_NANO);
+      buffer.setLength(0);
     }
-    recordMap.put(
-        records.get(0).getTimestamp() * TIMESTAMP_TO_NANO, records.get(0).getRecordDataValue());
-    for (int i = 1; i < records.size(); i++) {
-      Record record = records.get(i);
-      sql.append(" or time = ").append(record.getTimestamp() * TIMESTAMP_TO_NANO);
-      recordMap.put(record.getTimestamp() * TIMESTAMP_TO_NANO, record.getRecordDataValue());
+    buffer.append("time IN (");
+    for (Record record : records) {
+      if (record.getRecordDataValue().size() != sensors.size()) {
+        return new Status(
+            false,
+            new TsdbException("Record data schema mismatch"),
+            String.format(
+                "Expected record values: %d, but got %d",
+                sensors.size(), record.getRecordDataValue().size()));
+      }
+      buffer.append(record.getTimestamp() * TIMESTAMP_TO_NANO).append(", ");
     }
-    if (!deviceSchemas.isEmpty()) {
-      sql.append(")");
-    }
+    buffer.setLength(buffer.length() - 2);
+    String condTimestamps = buffer.append(")").toString();
 
-    try {
-      long point = 0;
-      int line = 0;
-      Response response = cnosConnection.execute(sql.toString());
-      BufferedReader bufferedReader =
-          new BufferedReader(new InputStreamReader(response.body().byteStream()));
-      String line_json;
-      while ((line_json = bufferedReader.readLine()) != null) {
-        ObjectMapper objectMapper = new ObjectMapper();
-        LinkedHashMap<String, Object> resHashMap =
-            objectMapper.readValue(
-                line_json, new TypeReference<LinkedHashMap<String, Object>>() {});
-        line++;
+    HashSet<String> responseTimestamps = new HashSet<>(records.size());
 
-        Long time = (Long) resHashMap.get("time");
-        List<Object> values = recordMap.get(time);
+    for (int columnIdx = 0; columnIdx < sensors.size(); columnIdx++) {
+      // Instant sensorInstant = Instant.now();
 
-        for (int i = 0; i < values.size(); i++) {
-          String target = String.valueOf(values.get(i));
-          String result = resHashMap.get(deviceSchema.getSensors().get(i).getName()).toString();
-          if (!result.equals(target)) {
-            LOGGER.error("Using SQL: " + sql + ",Expected:" + result + " but was: " + target);
-          } else {
-            point++;
-          }
+      Sensor sensor = sensors.get(columnIdx);
+      SensorType sensorType = sensor.getSensorType();
+
+      buffer.setLength(0);
+      buffer
+          .append("SELECT CAST(time AS BIGINT) AS time, ")
+          .append(sensor.getName())
+          .append(" FROM ")
+          .append(deviceSchema.getGroup())
+          .append(" WHERE device ='")
+          .append(deviceSchema.getDevice())
+          .append("'")
+          .append("AND ")
+          .append(condTimestamps)
+          .append("ORDER BY time ASC");
+      String sql = buffer.toString();
+
+      try (CnosdbResponse response = connection.executeQuery(sql)) {
+        if (!response.isOk()) {
+          // LOGGER.error("Error: query failed, SQL: {}, error: {}", sql,
+          // response.getErrorMessage());
+          return new Status(false, response.getFailException(), response.getErrorMessage());
         }
+        if (response.getResponseTitles() == null || response.getResponseTitles().length != 2) {
+          String errorMessage =
+              String.format(
+                  "unexpected response titles, SQL: %s, titles: %s",
+                  sql, StringUtils.join(response.getResponseTitles(), ", "));
+          // LOGGER.error("Error: {}", errorMessage);
+          return new Status(false, new TsdbException(errorMessage), errorMessage);
+        }
+
+        int lineNum = 0;
+        String[] line;
+        while (response.hasNext()) {
+          Record r = records.get(lineNum);
+          if (r == null) {
+            String errorMessage =
+                String.format(
+                    "response is larger than expected, SQL: %s, expected: %s, response: %s",
+                    sql, records.size(), lineNum);
+            // LOGGER.error("Error: {}", errorMessage);
+            return new Status(false, new TsdbException(errorMessage), errorMessage);
+          }
+          line = response.next();
+          responseTimestamps.add(line[0]);
+          long timestamp = r.getTimestamp() * TIMESTAMP_TO_NANO;
+          if (!compareInt64WithString(timestamp, line[0])) {
+            String errorMessage =
+                String.format(
+                    "response timestamp mismatch, SQL: %s, line: %s, expected: %s, response: %s",
+                    sql, lineNum, timestamp, line[0]);
+            // LOGGER.error("Error: {}", errorMessage);
+            return new Status(false, new TsdbException(errorMessage), errorMessage);
+          }
+          Object value = r.getRecordDataValue().get(columnIdx);
+          if (!compare(sensorType, value, line[1])) {
+            String errorMessage =
+                String.format(
+                    "Error: response value mismatch, SQL: %s, line: %s, expected: %s, response: %s",
+                    sql, lineNum, value, line[1]);
+            // LOGGER.error("Error: {}", errorMessage);
+            return new Status(false, new TsdbException(errorMessage), errorMessage);
+          }
+          lineNum += 1;
+        }
+      } catch (IOException e) {
+        LOGGER.error("Error: query failed, because " + e);
+        return new Status(false, e, e.getMessage());
       }
-      response.close();
-      if (recordMap.size() != line) {
-        LOGGER.error(
-            "Using SQL: " + sql + ",Expected line:" + recordMap.size() + " but was: " + line);
-      }
-      if (!config.isIS_QUIET_MODE()) {
-        LOGGER.debug("{} 查到数据点数: {}", Thread.currentThread().getName(), point);
-      }
-      return new Status(true, point);
-    } catch (Exception e) {
-      LOGGER.error("Failed verify query, because " + e);
-      return new Status(false, e, e.getMessage());
+      // LOGGER.info("Sensor costs: {} ms", Instant.now().toEpochMilli() -
+      // sensorInstant.toEpochMilli());
     }
+
+    LOGGER.info("Total costs: {} ms", Instant.now().toEpochMilli() - startInstant.toEpochMilli());
+    return new Status(true, responseTimestamps.size());
+  }
+
+  static boolean compare(SensorType dataType, Object dataValue, String resultValue) {
+    switch (dataType) {
+      case BOOLEAN:
+        if (compareBooleanWithString((Boolean) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      case INT32:
+        if (compareInt32WithString((Integer) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      case INT64:
+        if (compareInt64WithString((Long) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      case FLOAT:
+        if (compareFloatWithString((Float) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      case DOUBLE:
+        if (compareDoubleWithString((Double) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      case TEXT:
+        if (compareTextWithString((String) dataValue, resultValue)) {
+          return true;
+        }
+        break;
+      default:
+        LOGGER.error(
+            "Error Type: {}, record: '{}', response: '{}'", dataType, dataValue, resultValue);
+        return false;
+    }
+    LOGGER.error(
+        "Data not equal: Type: {}, record: '{}', response: '{}'", dataType, dataValue, resultValue);
+    return false;
+  }
+
+  static boolean compareBooleanWithString(Boolean a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    if (a) {
+      return b.equals("true");
+    } else {
+      return b.equals("false");
+    }
+  }
+
+  static boolean compareInt32WithString(Integer a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    try {
+      return a.equals(Integer.parseInt(b));
+    } catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  static boolean compareInt64WithString(Long a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    try {
+      return a.equals(Long.parseLong(b));
+    } catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  static boolean compareFloatWithString(Float a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    try {
+      float bv = Float.parseFloat(b);
+      return Math.abs(a - bv) < 1E-9;
+    } catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  static boolean compareDoubleWithString(Double a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    try {
+      double bv = Double.parseDouble(b);
+      return Math.abs(a - bv) < 1E-9;
+    } catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  static boolean compareTextWithString(String a, String b) {
+    if (a == null) {
+      return b == null;
+    }
+    return a.equals(b);
   }
 }

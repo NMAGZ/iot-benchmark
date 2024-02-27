@@ -99,13 +99,13 @@ public class CnosDB extends InfluxDB implements IDatabase {
 
   @Override
   public void cleanup() throws TsdbException {
-    try {
-      Response response = connection.execute("DROP DATABASE IF EXISTS " + cnosdbDatabase);
-      response.close();
-    } catch (Exception e) {
-      LOGGER.error("Cleanup CnosDB failed because ", e);
-      throw new TsdbException(e);
-    }
+    //    try {
+    //      Response response = connection.execute("DROP DATABASE IF EXISTS " + cnosdbDatabase);
+    //      response.close();
+    //    } catch (Exception e) {
+    //      LOGGER.error("Cleanup CnosDB failed because ", e);
+    //      throw new TsdbException(e);
+    //    }
   }
 
   @Override
@@ -303,7 +303,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
           .append("'")
           .append("AND ")
           .append(condTimestamps)
-          .append("ORDER BY time ASC");
+          .append(" ORDER BY time ASC");
       String sql = buffer.toString();
 
       try (CnosdbResponse response = connection.executeQuery(sql)) {
@@ -318,7 +318,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
                   "unexpected response titles, SQL: %s, titles: %s",
                   sql, StringUtils.join(response.getResponseTitles(), ", "));
           // LOGGER.error("Error: {}", errorMessage);
-          return new Status(false, new TsdbException(errorMessage), errorMessage);
+          return new Status(false, new TsdbException("unexpected result set"), errorMessage);
         }
 
         int lineNum = 0;
@@ -331,7 +331,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
                     "response is larger than expected, SQL: %s, expected: %s, response: %s",
                     sql, records.size(), lineNum);
             // LOGGER.error("Error: {}", errorMessage);
-            return new Status(false, new TsdbException(errorMessage), errorMessage);
+            return new Status(false, new TsdbException("unexpected result set"), errorMessage);
           }
           line = response.next();
           responseTimestamps.add(line[0]);
@@ -342,7 +342,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
                     "response timestamp mismatch, SQL: %s, line: %s, expected: %s, response: %s",
                     sql, lineNum, timestamp, line[0]);
             // LOGGER.error("Error: {}", errorMessage);
-            return new Status(false, new TsdbException(errorMessage), errorMessage);
+            return new Status(false, new TsdbException("unexpected result set"), errorMessage);
           }
           Object value = r.getRecordDataValue().get(columnIdx);
           if (!compare(sensorType, value, line[1])) {
@@ -351,7 +351,7 @@ public class CnosDB extends InfluxDB implements IDatabase {
                     "Error: response value mismatch, SQL: %s, line: %s, expected: %s, response: %s",
                     sql, lineNum, value, line[1]);
             // LOGGER.error("Error: {}", errorMessage);
-            return new Status(false, new TsdbException(errorMessage), errorMessage);
+            return new Status(false, new TsdbException("unexpected result set"), errorMessage);
           }
           lineNum += 1;
         }
@@ -359,11 +359,11 @@ public class CnosDB extends InfluxDB implements IDatabase {
         LOGGER.error("Error: query failed, because " + e);
         return new Status(false, e, e.getMessage());
       }
-      // LOGGER.info("Sensor costs: {} ms", Instant.now().toEpochMilli() -
+      // LOGGER.debug("Sensor costs: {} ms", Instant.now().toEpochMilli() -
       // sensorInstant.toEpochMilli());
     }
 
-    LOGGER.info("Total costs: {} ms", Instant.now().toEpochMilli() - startInstant.toEpochMilli());
+    LOGGER.debug("Total costs: {} ms", Instant.now().toEpochMilli() - startInstant.toEpochMilli());
     return new Status(true, responseTimestamps.size());
   }
 

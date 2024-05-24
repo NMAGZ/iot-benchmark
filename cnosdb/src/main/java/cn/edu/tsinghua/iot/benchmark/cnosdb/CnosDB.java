@@ -99,33 +99,44 @@ public class CnosDB extends InfluxDB implements IDatabase {
 
   @Override
   public void cleanup() throws TsdbException {
-    //    try {
-    //      Response response = connection.execute("DROP DATABASE IF EXISTS " + cnosdbDatabase);
-    //      response.close();
-    //    } catch (Exception e) {
-    //      LOGGER.error("Cleanup CnosDB failed because ", e);
-    //      throw new TsdbException(e);
-    //    }
+    try {
+      Response response = connection.executeDdl("DROP DATABASE IF EXISTS \"" + database + "\"");
+      response.close();
+    } catch (Exception e) {
+      LOGGER.error("Cleanup CnosDB failed because ", e);
+      throw new TsdbException(e);
+    }
+  }
+
+  @Override
+  public void close() {
+    influxDbInstance.close();
   }
 
   @Override
   public Double registerSchema(List<DeviceSchema> schemaList) throws TsdbException {
-    long start;
-    long end;
-    try {
-      start = System.nanoTime();
-      Response response =
-          connection.execute(
-              String.format(
-                  "create database if not exists %s with shard %d",
-                  cnosdbDatabase, config.getCNOSDB_SHARD_NUMBER()));
-      response.close();
-      end = System.nanoTime();
-    } catch (Exception e) {
-      LOGGER.error("RegisterSchema CnosDB failed because" + e.getMessage());
-      throw new TsdbException(e);
+    String sql =
+        String.format(
+            "CREATE DATABASE IF NOT EXISTS \"%s\" WITH SHARD %d",
+            database, config.getCNOSDB_SHARD_NUMBER());
+    long start = System.nanoTime();
+    int tryCount = 0;
+    Exception lastException = null;
+    while (tryCount < 3) {
+      try (CnosdbResponse response = connection.executeDdl(sql)) {
+        if (response.isOk()) {
+          long end = System.nanoTime();
+          return TimeUtils.convertToSeconds(end - start, "ns");
+        }
+        tryCount++;
+        lastException = response.getFailException();
+      } catch (Exception e) {
+        LOGGER.error("Register schema for CnosDB failed: {}", e.getMessage());
+        tryCount++;
+        lastException = e;
+      }
     }
-    return TimeUtils.convertToSeconds(end - start, "ns");
+    throw new TsdbException(lastException);
   }
 
   @Override
@@ -160,15 +171,14 @@ public class CnosDB extends InfluxDB implements IDatabase {
   @Override
   public Status addTailClausesAndExecuteQueryAndGetStatus(String sql) {
     if (config.getRESULT_ROW_LIMIT() >= 0) {
-      sql += " limit " + config.getRESULT_ROW_LIMIT();
+      sql += " LIMIT " + config.getRESULT_ROW_LIMIT();
     }
     if (!config.isIS_QUIET_MODE()) {
       LOGGER.info("{} query SQL: {}", Thread.currentThread().getName(), sql);
     }
 
-    try {
+    try (CnosdbResponse response = connection.executeDdl(sql)) {
       long cnt = 0;
-      Response response = connection.execute(sql);
       BufferedReader bufferedReader =
           new BufferedReader(new InputStreamReader(response.body().byteStream()));
       String line;

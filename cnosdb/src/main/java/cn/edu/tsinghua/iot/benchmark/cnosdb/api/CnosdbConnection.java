@@ -15,19 +15,27 @@ public class CnosdbConnection {
   private final String url;
   private final String authorization;
 
-  OkHttpClient client;
+  OkHttpClient ddlClient;
+  OkHttpClient queryClient;
 
   public CnosdbConnection(
       String cnosdbUrl, String cnosdbUser, String cnosdbPassword, String cnosdbDatabase)
       throws MalformedURLException {
+    this.ddlClient =
+        new OkHttpClient()
+            .newBuilder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(3, TimeUnit.SECONDS)
+            .build();
     ConnectionPool connectionPool =
         new ConnectionPool(config.getCLIENT_NUMBER(), 5, TimeUnit.MINUTES);
-    this.client = new OkHttpClient().newBuilder().connectionPool(connectionPool).build();
+    this.queryClient = new OkHttpClient().newBuilder().connectionPool(connectionPool).build();
     this.url = cnosdbUrl + "/api/v1/sql?db=" + cnosdbDatabase;
     this.authorization = Credentials.basic(cnosdbUser, cnosdbPassword);
   }
 
-  public Response execute(String sql) throws IOException {
+  public CnosdbResponse executeDdl(String sql) throws IOException {
     RequestBody requestBody = RequestBody.create(mediaTypeNdJson, sql.getBytes());
     Request request =
         new Request.Builder()
@@ -36,7 +44,7 @@ public class CnosdbConnection {
             .addHeader("Authorization", this.authorization)
             .post(requestBody)
             .build();
-    return client.newCall(request).execute();
+    return new CnosdbResponse(ddlClient.newCall(request), false);
   }
 
   public CnosdbResponse executeQuery(String sql) {
@@ -48,6 +56,10 @@ public class CnosdbConnection {
             .addHeader("Authorization", this.authorization)
             .post(requestBody)
             .build();
-    return new CnosdbResponse(client.newCall(request));
+    return new CnosdbResponse(queryClient.newCall(request), true);
+  }
+
+  public void close() throws Exception {
+    this.queryClient.dispatcher().executorService().shutdown();
   }
 }

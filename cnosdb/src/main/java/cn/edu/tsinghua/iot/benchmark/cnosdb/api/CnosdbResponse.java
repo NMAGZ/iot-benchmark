@@ -21,17 +21,21 @@ public class CnosdbResponse implements Iterator<String[]>, Closeable {
   private Iterator<String[]> responseIterator;
   private String[] responseTitles;
 
-  public CnosdbResponse(Call call) {
+  public CnosdbResponse(Call call, boolean isCsvResponse) {
     try {
       this.response = call.execute();
       if (response.body() != null) {
         if (response.code() / 100 == 2) {
           this.closed = false;
           this.ok = true;
-          this.resultReader =
-              new CSVReaderBuilder(new InputStreamReader(response.body().byteStream())).build();
-          this.responseIterator = this.resultReader.iterator();
-          this.responseTitles = this.responseIterator.next();
+          if (isCsvResponse) {
+            this.resultReader =
+                new CSVReaderBuilder(new InputStreamReader(response.body().byteStream())).build();
+            this.responseIterator = this.resultReader.iterator();
+            this.responseTitles = this.responseIterator.next();
+          } else {
+            this.closed = true;
+          }
         } else {
           this.closed = true;
           this.ok = false;
